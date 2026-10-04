@@ -119,7 +119,6 @@ def get_today_schedule():
         if "dates" in data and date_string in data["dates"]:
             return data["dates"][date_string]
 
-    if date_key not in data:
     return {}
     )
 
