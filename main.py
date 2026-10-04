@@ -1,364 +1,250 @@
 import os
-import time
 import json
+import time
 import hmac
 import hashlib
-import logging
 import requests
-
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from bs4 import BeautifulSoup
 
 
-# ============================================================
+# =========================
 # НАСТРОЙКИ
-# ============================================================
+# =========================
+
+TIMEZONE = ZoneInfo("Europe/Moscow")
+
+TUYA_BASE_URL = "https://openapi.tuyaeu.com"
 
 TUYA_ACCESS_ID = os.getenv("TUYA_ACCESS_ID")
 TUYA_ACCESS_SECRET = os.getenv("TUYA_ACCESS_SECRET")
 TUYA_DEVICE_ID = os.getenv("TUYA_DEVICE_ID")
 
-# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TUYA_BASE_URL = "https://openapi.tuyaeu.com"
+SCHEDULE_FILE = "schedule.json"
 
-PRAYER_URL = "https://kogdanamaz.ru/default.php?city=MYKP"
-
-# Всё приложение работает по московскому времени
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-
-
-# ============================================================
-# НАСТРОЙКИ АВТОМАТИКИ
-# ============================================================
-
-# Через сколько минут после времени намаза запускать азан
-START_DELAY_MINUTES = 2
-
-# Сколько минут работает азан
-AZAN_DURATION_MINUTES = 6
-
-# Как часто проверять время
+# Проверяем локальное время каждые 5 секунд.
+# Это НЕ запрос к Tuya.
 CHECK_INTERVAL_SECONDS = 5
 
-# После какого времени обновлять расписание нового дня
-SCHEDULE_REFRESH_HOUR = 1
+# За сколько минут до азана заранее получаем Tuya token.
+PREPARE_MINUTES = 5
 
+# Через сколько минут после включения выключаем розетку.
+AZAN_DURATION_MINUTES = 6
 
-# ============================================================
-# НАМАЗЫ
-# ============================================================
+# +2 минуты к времени из расписания.
+START_DELAY_MINUTES = 2
 
+# Названия молитв, которые используем.
 PRAYERS = [
-    "Зухр",
-    "Аср",
-    "Магриб",
-    "Иша"
+    "Fajr",
+    "Dhuhr",
+    "Asr",
+    "Maghrib",
+    "Isha",
 ]
 
 
-# ============================================================
-# ГЛОБАЛЬНОЕ СОСТОЯНИЕ
-# ============================================================
+# =========================
+# ПРОВЕРКА НАСТРОЕК
+# =========================
 
-current_schedule = {}
+def check_environment():
+    required = {
+        "TUYA_ACCESS_ID": TUYA_ACCESS_ID,
+        "TUYA_ACCESS_SECRET": TUYA_ACCESS_SECRET,
+        "TUYA_DEVICE_ID": TUYA_DEVICE_ID,
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    }
 
-schedule_loaded_date = None
-
-executed_events = set()
-
-
-# ============================================================
-# ВРЕМЯ МОСКВА
-# ============================================================
-
-def now_moscow():
-    return datetime.now(MOSCOW_TZ)
-
-
-# ============================================================
-# ЛОГИ
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s"
-)
-
-
-def log(level, message):
-
-    now = now_moscow()
-
-    timestamp = now.strftime(
-        "%d.%m.%Y %H:%M:%S"
-    )
-
-    logging.info(
-        f"{timestamp} | {level} | {message}"
-    )
-
-
-# ============================================================
-# TELEGRAM УВЕДОМЛЕНИЯ
-# ============================================================
-
-def telegram_notify(message):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning(
-            "Telegram не настроен: нет TOKEN или CHAT_ID"
-        )
-        return False
-
-    try:
-
-        url = (
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-        )
-
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
-            },
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not data.get("ok"):
-            raise Exception(data)
-
-        return True
-
-    except Exception as error:
-
-        log(
-            "ERROR",
-            f"❌ Ошибка Telegram: {error}"
-        )
-
-        return False
-
-
-# ============================================================
-# ПРОВЕРКА SECRETS
-# ============================================================
-
-def check_secrets():
-
-    missing = []
-
-    if not TUYA_ACCESS_ID:
-        missing.append("TUYA_ACCESS_ID")
-
-    if not TUYA_ACCESS_SECRET:
-        missing.append("TUYA_ACCESS_SECRET")
-
-    if not TUYA_DEVICE_ID:
-        missing.append("TUYA_DEVICE_ID")
-
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
+    missing = [name for name, value in required.items() if not value]
 
     if missing:
-
-        raise Exception(
-            "Не найдены Secrets: "
+        raise RuntimeError(
+            "Не найдены переменные окружения: "
             + ", ".join(missing)
         )
 
-    log(
-        "INFO",
-        "✅ Все Secrets Tuya найдены"
+    print("✅ Все необходимые Secrets найдены")
+
+
+# =========================
+# JSON РАСПИСАНИЕ
+# =========================
+
+def load_schedule():
+    if not os.path.exists(SCHEDULE_FILE):
+        raise FileNotFoundError(
+            f"Файл {SCHEDULE_FILE} не найден"
+        )
+
+    with open(SCHEDULE_FILE, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    return data
+
+
+def get_today_schedule():
+    data = load_schedule()
+
+    today = datetime.now(TIMEZONE).date()
+    date_string = today.strftime("%Y-%m-%d")
+
+    # Вариант:
+    # {
+    #   "2026-10-04": {
+    #       "Fajr": "05:12",
+    #       ...
+    #   }
+    # }
+
+    if isinstance(data, dict):
+        if date_string in data:
+            return data[date_string]
+
+        # Если JSON имеет структуру {"dates": {...}}
+        if "dates" in data and date_string in data["dates"]:
+            return data["dates"][date_string]
+
+    raise RuntimeError(
+        f"В {SCHEDULE_FILE} нет расписания на {date_string}"
     )
 
 
-# ============================================================
-# ПОЛУЧЕНИЕ РАСПИСАНИЯ С САЙТА
-# ============================================================
+# =========================
+# ВРЕМЯ АЗАНА
+# =========================
 
-def get_prayer_times():
+def get_prayer_datetime(prayer_time):
+    now = datetime.now(TIMEZONE)
 
-    log(
-        "INFO",
-        "📡 Получаем расписание намазов с сайта..."
+    hour, minute = map(int, prayer_time.split(":"))
+
+    return now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
     )
+
+
+def get_next_prayer():
+    schedule = get_today_schedule()
+
+    now = datetime.now(TIMEZONE)
+
+    candidates = []
+
+    for prayer in PRAYERS:
+        if prayer not in schedule:
+            continue
+
+        prayer_time = schedule[prayer]
+
+        if not prayer_time:
+            continue
+
+        prayer_dt = get_prayer_datetime(prayer_time)
+
+        # +2 минуты — фактическое время запуска.
+        start_dt = prayer_dt + timedelta(
+            minutes=START_DELAY_MINUTES
+        )
+
+        if start_dt > now:
+            candidates.append(
+                (start_dt, prayer, prayer_time)
+            )
+
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda item: item[0])
+
+
+# =========================
+# TUYA
+# =========================
+
+def get_tuya_token():
+    """
+    Получаем token Tuya.
+
+    Этот запрос НЕ вызывается каждые 5 секунд.
+    Мы вызываем его примерно за 5 минут
+    до нужного времени.
+    """
+
+    timestamp = str(int(time.time() * 1000))
+
+    method = "GET"
+    path = "/v1.0/token?grant_type=1"
+
+    string_to_sign = method + "\n" + hashlib.sha256(
+        b""
+    ).hexdigest() + "\n\n" + path
+
+    sign_message = (
+        TUYA_ACCESS_ID
+        + timestamp
+        + string_to_sign
+    )
+
+    sign = hmac.new(
+        TUYA_ACCESS_SECRET.encode(),
+        sign_message.encode(),
+        hashlib.sha256,
+    ).hexdigest().upper()
+
+    headers = {
+        "client_id": TUYA_ACCESS_ID,
+        "sign": sign,
+        "t": timestamp,
+        "sign_method": "HMAC-SHA256",
+    }
 
     response = requests.get(
-        PRAYER_URL,
-        timeout=30,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
+        TUYA_BASE_URL + path,
+        headers=headers,
+        timeout=15,
     )
 
     response.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
+    data = response.json()
 
-    prayer_times = {}
-
-    for table in soup.find_all("table"):
-
-        for row in table.find_all("tr"):
-
-            cells = row.find_all(
-                ["td", "th"]
-            )
-
-            if len(cells) < 2:
-                continue
-
-            name = cells[0].get_text(
-                strip=True
-            )
-
-            value = cells[1].get_text(
-                strip=True
-            )
-
-            for prayer in PRAYERS:
-
-                if prayer in name:
-
-                    if ":" not in value:
-                        continue
-
-                    try:
-
-                        parts = value.split(":")
-
-                        hour = int(parts[0])
-                        minute = int(parts[1])
-
-                        if (
-                            0 <= hour <= 23
-                            and
-                            0 <= minute <= 59
-                        ):
-
-                            prayer_times[prayer] = (
-                                f"{hour:02d}:"
-                                f"{minute:02d}"
-                            )
-
-                    except ValueError:
-                        continue
-
-    missing = [
-        prayer
-        for prayer in PRAYERS
-        if prayer not in prayer_times
-    ]
-
-    if missing:
-
-        raise Exception(
-            "Не удалось получить расписание: "
-            + ", ".join(missing)
+    if not data.get("success"):
+        raise RuntimeError(
+            f"Ошибка получения Tuya token: {data}"
         )
 
-    return prayer_times
+    token = data["result"]["access_token"]
+
+    print("🔑 Tuya token получен")
+
+    return token
 
 
-# ============================================================
-# ОБНОВЛЕНИЕ РАСПИСАНИЯ
-# ============================================================
+def tuya_request(token, method, path, body=""):
+    timestamp = str(int(time.time() * 1000))
 
-def refresh_schedule():
-
-    global current_schedule
-    global schedule_loaded_date
-
-    try:
-
-        new_schedule = get_prayer_times()
-
-        current_schedule = new_schedule
-
-        schedule_loaded_date = (
-            now_moscow().date()
-        )
-
-        log(
-            "INFO",
-            "💾 Расписание успешно обновлено"
-        )
-
-        for prayer in PRAYERS:
-
-            log(
-                "INFO",
-                f"🕌 {prayer}: "
-                f"{current_schedule[prayer]}"
-            )
-
-        return True
-
-    except Exception as error:
-
-        log(
-            "ERROR",
-            f"❌ Ошибка получения расписания: "
-            f"{error}"
-        )
-
-        return False
-
-
-# ============================================================
-# TUYA SHA256
-# ============================================================
-
-def sha256(data):
-
-    return hashlib.sha256(
-        data.encode("utf-8")
+    body_hash = hashlib.sha256(
+        body.encode()
     ).hexdigest()
-
-
-# ============================================================
-# СОЗДАНИЕ ПОДПИСИ TUYA
-# ============================================================
-
-def create_signature(
-    method,
-    path,
-    token="",
-    body=""
-):
-
-    timestamp = str(
-        int(time.time() * 1000)
-    )
-
-    content_hash = sha256(body)
 
     string_to_sign = (
         method
         + "\n"
-        + content_hash
-        + "\n"
-        + "\n"
+        + body_hash
+        + "\n\n"
         + path
     )
 
-    sign_string = (
+    sign_message = (
         TUYA_ACCESS_ID
         + token
         + timestamp
@@ -366,153 +252,10 @@ def create_signature(
     )
 
     sign = hmac.new(
-        TUYA_ACCESS_SECRET.encode(
-            "utf-8"
-        ),
-        sign_string.encode(
-            "utf-8"
-        ),
-        hashlib.sha256
+        TUYA_ACCESS_SECRET.encode(),
+        sign_message.encode(),
+        hashlib.sha256,
     ).hexdigest().upper()
-
-    return timestamp, sign
-
-
-# ============================================================
-# ПОЛУЧЕНИЕ TOKEN TUYA
-# ============================================================
-
-def get_tuya_token():
-
-    method = "GET"
-
-    path = "/v1.0/token?grant_type=1"
-
-    timestamp, sign = create_signature(
-        method,
-        path
-    )
-
-    headers = {
-        "client_id": TUYA_ACCESS_ID,
-        "sign": sign,
-        "t": timestamp,
-        "sign_method": "HMAC-SHA256"
-    }
-
-    response = requests.get(
-        TUYA_BASE_URL + path,
-        headers=headers,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("success"):
-
-        raise Exception(
-            f"Ошибка получения Tuya token: "
-            f"{data}"
-        )
-
-    return data[
-        "result"
-    ][
-        "access_token"
-    ]
-
-
-# ============================================================
-# УПРАВЛЕНИЕ РОЗЕТКОЙ
-# ============================================================
-
-def get_socket_state(token):
-    method = "GET"
-
-    path = (
-        f"/v1.0/iot-03/devices/"
-        f"{TUYA_DEVICE_ID}/status"
-    )
-
-    timestamp, sign = create_signature(
-        method,
-        path,
-        token
-    )
-
-    headers = {
-        "client_id": TUYA_ACCESS_ID,
-        "access_token": token,
-        "sign": sign,
-        "t": timestamp,
-        "sign_method": "HMAC-SHA256"
-    }
-
-    response = requests.get(
-        TUYA_BASE_URL + path,
-        headers=headers,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("success"):
-        raise Exception(
-            f"Ошибка получения состояния Tuya: {data}"
-        )
-
-    for item in data.get("result", []):
-        if item.get("code") == "switch_1":
-            return bool(item.get("value"))
-
-    raise Exception(
-        "Не найдено состояние switch_1"
-    )
-
-
-def set_socket(state, token):
-    action = (
-        "ВКЛЮЧАЕМ"
-        if state
-        else "ВЫКЛЮЧАЕМ"
-    )
-
-    log(
-        "INFO",
-        f"🔌 {action} РОЗЕТКУ..."
-    )
-
-    method = "POST"
-
-    path = (
-        f"/v1.0/iot-03/devices/"
-        f"{TUYA_DEVICE_ID}/commands"
-    )
-
-    body_dict = {
-        "commands": [
-            {
-                "code": "switch_1",
-                "value": state
-            }
-        ]
-    }
-
-    body = json.dumps(
-        body_dict,
-        separators=(",", ":")
-    )
-
-    timestamp, sign = create_signature(
-        method,
-        path,
-        token,
-        body
-    )
 
     headers = {
         "client_id": TUYA_ACCESS_ID,
@@ -520,574 +263,319 @@ def set_socket(state, token):
         "sign": sign,
         "t": timestamp,
         "sign_method": "HMAC-SHA256",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    response = requests.post(
-        TUYA_BASE_URL + path,
-        headers=headers,
-        data=body,
-        timeout=30
-    )
+    url = TUYA_BASE_URL + path
+
+    if method == "GET":
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=15,
+        )
+    else:
+        response = requests.post(
+            url,
+            headers=headers,
+            data=body,
+            timeout=15,
+        )
 
     response.raise_for_status()
 
     data = response.json()
 
     if not data.get("success"):
-        raise Exception(
-            f"Ошибка управления Tuya: {data}"
+        raise RuntimeError(
+            f"Tuya API error: {data}"
         )
 
-    if state:
-        log(
-            "INFO",
-            "✅ РОЗЕТКА ВКЛЮЧЕНА"
-        )
-    else:
-        log(
-            "INFO",
-            "✅ РОЗЕТКА ВЫКЛЮЧЕНА"
-        )
+    return data
 
 
-# ============================================================
-# СОЗДАНИЕ СОБЫТИЙ НА СЕГОДНЯ
-# ============================================================
-
-def get_today_events():
-
-    events = {}
-
-    now = now_moscow()
-
-    today = now.date()
-
-    for prayer in PRAYERS:
-
-        prayer_time = current_schedule.get(
-            prayer
-        )
-
-        if not prayer_time:
-            continue
-
-        hour, minute = map(
-            int,
-            prayer_time.split(":")
-        )
-
-        prayer_datetime = datetime(
-            year=today.year,
-            month=today.month,
-            day=today.day,
-            hour=hour,
-            minute=minute,
-            tzinfo=MOSCOW_TZ
-        )
-
-        event_time = (
-            prayer_datetime
-            + timedelta(
-                minutes=START_DELAY_MINUTES
-            )
-        )
-
-        events[prayer] = event_time
-
-    return events
-
-
-# ============================================================
-# ВЫВОД РАСПИСАНИЯ
-# ============================================================
-
-def print_schedule():
-
-    now = now_moscow()
-
-    log(
-        "INFO",
-        "=" * 60
+def get_socket_state(token):
+    path = (
+        f"/v1.0/devices/"
+        f"{TUYA_DEVICE_ID}/status"
     )
 
-    log(
-        "INFO",
-        f"📅 РАСПИСАНИЕ НА "
-        f"{now.strftime('%d.%m.%Y')}"
+    data = tuya_request(
+        token,
+        "GET",
+        path,
     )
 
-    events = get_today_events()
+    for item in data["result"]:
+        if item["code"] in (
+            "switch",
+            "switch_1",
+            "switch_led",
+        ):
+            return bool(item["value"])
 
-    for prayer in PRAYERS:
+    raise RuntimeError(
+        "Не удалось найти состояние розетки"
+    )
 
-        original_time = current_schedule.get(
-            prayer
+
+def set_socket(token, state):
+    path = (
+        f"/v1.0/devices/"
+        f"{TUYA_DEVICE_ID}/commands"
+    )
+
+    body = json.dumps(
+        {
+            "commands": [
+                {
+                    "code": "switch",
+                    "value": state,
+                }
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+    data = tuya_request(
+        token,
+        "POST",
+        path,
+        body,
+    )
+
+    print(
+        f"🔌 Розетка: "
+        f"{'ВКЛ' if state else 'ВЫКЛ'}"
+    )
+
+    return data
+
+
+# =========================
+# TELEGRAM
+# =========================
+
+def telegram_send(message):
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=15,
         )
 
-        event_time = events.get(
-            prayer
-        )
-
-        if original_time and event_time:
-
-            log(
-                "INFO",
-                f"🕌 {prayer}: "
-                f"{original_time} → "
-                f"запуск "
-                f"{event_time.strftime('%H:%M')}"
+        if not response.ok:
+            print(
+                "⚠️ Telegram error:",
+                response.text,
             )
 
-    log(
-        "INFO",
-        f"➕ Задержка: "
-        f"{START_DELAY_MINUTES} мин."
-    )
-
-    log(
-        "INFO",
-        f"🔊 Длительность: "
-        f"{AZAN_DURATION_MINUTES} мин."
-    )
-
-    log(
-        "INFO",
-        "🌍 Часовой пояс: Europe/Moscow"
-    )
-
-    log(
-        "INFO",
-        "=" * 60
-    )
-
-
-# ============================================================
-# ПОИСК СЛЕДУЮЩЕГО АЗАНА
-# ============================================================
-
-def print_next_azan():
-
-    now = now_moscow()
-
-    events = get_today_events()
-
-    future_events = []
-
-    for prayer, event_time in events.items():
-
-        if event_time > now:
-
-            future_events.append(
-                (
-                    event_time,
-                    prayer
-                )
-            )
-
-    if future_events:
-
-        future_events.sort(
-            key=lambda x: x[0]
-        )
-
-        event_time, prayer = (
-            future_events[0]
-        )
-
-        log(
-            "INFO",
-            f"🎯 Следующий азан: "
-            f"{prayer}"
-        )
-
-        log(
-            "INFO",
-            f"⏳ Запуск в: "
-            f"{event_time.strftime('%H:%M:%S')}"
-        )
-
-    else:
-
-        log(
-            "INFO",
-            "🌙 На сегодня азанов больше нет"
+    except Exception as error:
+        print(
+            "⚠️ Ошибка Telegram:",
+            error,
         )
 
 
-# ============================================================
-# ЗАПУСК АЗАНА
-# ============================================================
+# =========================
+# АЗАН
+# =========================
 
-def run_azan(prayer):
-    event_id = (
-        f"{now_moscow().date()}_{prayer}"
-    )
-
-    if event_id in executed_events:
-        log(
-            "WARNING",
-            f"⚠️ {prayer} уже запускался"
-        )
-        return
-
-    # Отмечаем событие сразу, чтобы не произошло
-    # повторного запуска этого азана.
-    executed_events.add(event_id)
-
-    log(
-        "INFO",
-        "!" * 60
-    )
-
-    log(
-        "INFO",
-        f"🕌 ВРЕМЯ АЗАНА: {prayer}"
-    )
-
-    log(
-        "INFO",
-        "!" * 60
+def run_azan(
+    token,
+    prayer_name,
+    prayer_time,
+):
+    print(
+        f"🕌 Наступил {prayer_name}: "
+        f"{prayer_time}"
     )
 
     try:
-        # Получаем token ОДИН раз на один азан.
-        token = get_tuya_token()
+        current_state = get_socket_state(token)
 
-        # Проверяем текущее состояние розетки.
-        socket_state = get_socket_state(token)
-
-        log(
-            "INFO",
-            "🔌 Текущее состояние розетки: "
-            f"{'ВКЛ' if socket_state else 'ВЫКЛ'}"
+        print(
+            "🔌 Текущее состояние:",
+            "ВКЛ" if current_state else "ВЫКЛ",
         )
 
-        if socket_state:
-            # Если человек уже включил розетку вручную,
-            # повторную команду ВКЛ не отправляем.
-            log(
-                "INFO",
+        if current_state:
+            # Человек уже включил розетку.
+            # Повторно ВКЛ не отправляем.
+            print(
                 "ℹ️ Розетка уже включена. "
-                "Команду ВКЛ не отправляем."
-            )
-
-            telegram_notify(
-                f"🕌 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n"
-                f"🔊 АЗАН НАЧАЛСЯ\n\n"
-                f"🕌 Намаз: {prayer}\n"
-                f"🔌 Розетка уже была включена\n"
-                f"⏱ Выключим через "
-                f"{AZAN_DURATION_MINUTES} мин."
+                "Повторное ВКЛ не отправляем."
             )
         else:
-            # Если розетка выключена — включаем её.
-            set_socket(True, token)
+            set_socket(token, True)
 
-            log(
-                "INFO",
-                "🔊 АЗАН НАЧАЛСЯ"
-            )
-
-            telegram_notify(
-                f"🕌 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n"
-                f"🔊 АЗАН НАЧАЛСЯ\n\n"
-                f"🕌 Намаз: {prayer}\n"
-                f"🔌 Розетка включена\n"
-                f"⏱ Длительность: "
-                f"{AZAN_DURATION_MINUTES} мин."
-            )
-
-        log(
-            "INFO",
-            f"⏱️ Работаем {AZAN_DURATION_MINUTES} минут"
+        telegram_send(
+            f"🕌 {prayer_name}\n"
+            f"Азан: {prayer_time}\n"
+            f"Розетка включена/уже была включена.\n"
+            f"Автоматическое выключение через "
+            f"{AZAN_DURATION_MINUTES} минут."
         )
 
-        # Ждём 6 минут.
+        # Важно:
+        # здесь мы НЕ опрашиваем Tuya каждые 5 секунд.
+        # Просто ждём локально 6 минут.
         time.sleep(
             AZAN_DURATION_MINUTES * 60
         )
 
-        # Через 6 минут ВСЕГДА отправляем ВЫКЛ.
-        # Неважно, включили розетку мы или человек.
-        log(
-            "INFO",
-            "🔌 6 минут прошло. Выключаем розетку..."
+        # В любом случае выключаем.
+        set_socket(token, False)
+
+        telegram_send(
+            f"🔌 {prayer_name}: "
+            f"розетка выключена."
         )
 
-        set_socket(False, token)
-
-        log(
-            "INFO",
-            f"🏁 АЗАН ЗАВЕРШЁН: {prayer}"
-        )
-
-        telegram_notify(
-            f"🕌 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n"
-            f"⏹ АЗАН ЗАВЕРШЁН\n\n"
-            f"🕌 Намаз: {prayer}\n"
-            f"🔌 Розетка выключена\n"
-            f"🕐 Время: "
-            f"{now_moscow().strftime('%H:%M:%S')}"
+        print(
+            f"✅ {prayer_name}: цикл завершён"
         )
 
     except Exception as error:
-        log(
-            "ERROR",
-            f"❌ Ошибка во время азана: {error}"
+        print(
+            f"❌ Ошибка во время {prayer_name}:",
+            error,
         )
 
-        telegram_notify(
-            "⚠️ ОШИБКА ВО ВРЕМЯ АЗАНА\n\n"
-            f"🕌 Намаз: {prayer}\n"
-            f"❌ Ошибка: {error}\n"
-            f"🕐 {now_moscow().strftime('%d.%m.%Y %H:%M:%S')}"
-        )
-
-
-# ============================================================
-# ОБНОВЛЕНИЕ РАСПИСАНИЯ НОВОГО ДНЯ
-# ============================================================
-
-def check_new_day():
-
-    global executed_events
-
-    now = now_moscow()
-
-    today = now.date()
-
-    # Если расписание уже на сегодняшний день
-    # ничего не делаем
-
-    if schedule_loaded_date == today:
-
-        return
-
-    # До 01:00 не обновляем
-
-    if now.hour < SCHEDULE_REFRESH_HOUR:
-
-        return
-
-    log(
-        "INFO",
-        "🌙 Новый день. Обновляем расписание..."
-    )
-
-    # Очищаем выполненные события прошлого дня
-
-    executed_events.clear()
-
-    success = refresh_schedule()
-
-    if success:
-
-        print_schedule()
-
-        print_next_azan()
-
-    else:
-
-        log(
-            "ERROR",
-            "❌ Не удалось обновить расписание"
-        )
-
-        telegram_notify(
-            "⚠️ ОШИБКА ОБНОВЛЕНИЯ РАСПИСАНИЯ\n\n"
-            "Не удалось получить актуальное расписание намазов.\n"
-            f"🕐 {now_moscow().strftime('%d.%m.%Y %H:%M:%S')}"
+        telegram_send(
+            f"❌ Ошибка Azan Bot\n"
+            f"{prayer_name}: {error}"
         )
 
 
-# ============================================================
-# ОСНОВНОЙ БОЕВОЙ РЕЖИМ
-# ============================================================
+# =========================
+# ОСНОВНОЙ ЦИКЛ
+# =========================
 
-def run_production_mode():
+def main():
+    check_environment()
 
-    log(
-        "INFO",
-        "=" * 60
+    print("🚀 Azan Bot запущен")
+    print("🌍 Часовой пояс: Europe/Moscow")
+    print(
+        f"⏱ Проверка времени: "
+        f"{CHECK_INTERVAL_SECONDS} сек."
+    )
+    print(
+        f"🔑 Подготовка Tuya: "
+        f"за {PREPARE_MINUTES} мин."
     )
 
-    log(
-        "INFO",
-        "🕌 АВТОМАТИЧЕСКИЙ АЗАН — МЕЧЕТЬ"
-    )
+    handled_prayers = set()
 
-    log(
-        "INFO",
-        "🤖 БОЕВОЙ РЕЖИМ 24/7"
-    )
-
-    log(
-        "INFO",
-        "=" * 60
-    )
-
-    # Проверяем Secrets
-
-    check_secrets()
-
-    # Первоначально получаем расписание
-
-    log(
-        "INFO",
-        "📅 Получаем актуальное расписание..."
-    )
-
-    success = refresh_schedule()
-
-    if not success:
-
-        raise Exception(
-            "Не удалось получить расписание "
-            "при запуске"
-        )
-
-    print_schedule()
-
-    print_next_azan()
-
-    log(
-        "INFO",
-        "=" * 60
-    )
-
-    log(
-        "INFO",
-        "🟢 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ"
-    )
-
-    telegram_notify(
-        "🟢 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n"
-        "Система автоматического азана запущена.\n\n"
-        f"📅 Дата: {now_moscow().strftime('%d.%m.%Y')}\n"
-        "📡 Расписание загружено\n"
-        "🔌 Tuya подключена\n"
-        "🤖 Сервер работает 24/7"
-    )
-
-    log(
-        "INFO",
-        "🤖 Режим: 24/7"
-    )
-
-    log(
-        "INFO",
-        "🕌 Ожидаем время намаза"
-    )
-
-    log(
-        "INFO",
-        "=" * 60
-    )
-
-    # Бесконечная работа
+    prepared_prayer = None
+    prepared_token = None
 
     while True:
-
         try:
+            now = datetime.now(TIMEZONE)
 
-            # Проверяем смену дня
+            next_prayer = get_next_prayer()
 
-            check_new_day()
+            if next_prayer is None:
+                # Новый день.
+                if now.hour == 0 and now.minute == 0:
+                    handled_prayers.clear()
 
-            # Получаем время
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
 
-            now = now_moscow()
+            start_dt, prayer_name, prayer_time = next_prayer
 
-            # Получаем события
+            prayer_key = (
+                now.date().isoformat(),
+                prayer_name,
+            )
 
-            events = get_today_events()
+            minutes_until = (
+                start_dt - now
+            ).total_seconds() / 60
 
-            # Проверяем каждый намаз
+            # ==================================
+            # ПОДГОТОВКА TUYA ЗА 5 МИНУТ
+            # ==================================
 
-            for prayer, event_time in events.items():
-
-                event_id = (
-                    f"{now.date()}_{prayer}"
+            if (
+                prepared_prayer != prayer_key
+                and 0 < minutes_until <= PREPARE_MINUTES
+            ):
+                print(
+                    f"🔑 До {prayer_name} "
+                    f"осталось {minutes_until:.1f} мин."
                 )
 
-                # Уже выполняли — пропускаем
+                prepared_token = get_tuya_token()
+                prepared_prayer = prayer_key
 
-                if event_id in executed_events:
-                    continue
+                print(
+                    f"✅ Tuya подготовлена "
+                    f"для {prayer_name}"
+                )
 
-                # Если время наступило
+            # ==================================
+            # ВРЕМЯ АЗАНА
+            # ==================================
 
-                if now >= event_time:
+            if (
+                now >= start_dt
+                and prayer_key not in handled_prayers
+            ):
+                # Если token по какой-либо причине
+                # не был подготовлен заранее —
+                # получаем его сейчас.
+                if prepared_token is None:
+                    print(
+                        "⚠️ Token не был подготовлен "
+                        "заранее. Получаем сейчас."
+                    )
 
-                    difference = (
-                        now - event_time
-                    ).total_seconds()
+                    prepared_token = get_tuya_token()
 
-                    # Допустимое окно 2 минуты
+                run_azan(
+                    prepared_token,
+                    prayer_name,
+                    prayer_time,
+                )
 
-                    if 0 <= difference <= 120:
+                handled_prayers.add(
+                    prayer_key
+                )
 
-                        run_azan(prayer)
-
-                    # Если сервер был выключен
-                    # долгое время — не запускаем
-                    # азан задним числом
-
-                    elif difference > 120:
-
-                        executed_events.add(event_id)
-
-                        log(
-                            "WARNING",
-                            f"⚠️ {prayer} пропущен. "
-                            f"Сервер был недоступен "
-                            f"во время запуска."
-                        )
+                prepared_prayer = None
+                prepared_token = None
 
             time.sleep(
                 CHECK_INTERVAL_SECONDS
             )
 
-        except KeyboardInterrupt:
-
-            log(
-                "INFO",
-                "🛑 Бот остановлен вручную"
+        except Exception as error:
+            print(
+                "❌ Ошибка основного цикла:",
+                error,
             )
 
-            break
-
-        except Exception as error:
-
-            log(
-                "ERROR",
-                f"❌ Ошибка основного цикла: "
+            telegram_send(
+                f"❌ Azan Bot\n"
+                f"Ошибка основного цикла:\n"
                 f"{error}"
             )
 
-            telegram_notify(
-                "⚠️ ОШИБКА СИСТЕМЫ АЗАНА\n\n"
-                f"❌ {error}\n\n"
-                f"🕐 {now_moscow().strftime('%d.%m.%Y %H:%M:%S')}\n"
-                "🔄 Повтор через 30 секунд..."
-            )
-
-            log(
-                "INFO",
-                "🔄 Повтор через 30 секунд..."
-            )
-
             time.sleep(30)
-
-
-# ============================================================
-# ЗАПУСК
-# ============================================================
-
-def main():
-
-    run_production_mode()
 
 
 if __name__ == "__main__":
