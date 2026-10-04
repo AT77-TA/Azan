@@ -120,8 +120,7 @@ def get_today_schedule():
             return data["dates"][date_string]
 
     return {}
-    )
-
+    
 
 # =========================
 # ВРЕМЯ АЗАНА
