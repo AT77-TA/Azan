@@ -729,17 +729,6 @@ def main():
                 prayer_key = (now.date().isoformat(), prayer_name)
                 minutes_until = (start_dt - now).total_seconds() / 60
 
-                if (
-                    prepared_prayer_key != prayer_key
-                    and 0 < minutes_until <= PREPARE_MINUTES
-                ):
-                    print(
-                        f"🔑 До {prayer_name} осталось "
-                        f"{minutes_until:.1f} мин. — готовим Tuya"
-                    )
-                    prepared_token = get_tuya_token()
-                    prepared_prayer_key = prayer_key
-                    print(f"✅ Tuya подготовлена для {prayer_name}")
 
             # Отдельно ищем уже наступившие события.
             # Это важно: get_next_prayer() показывает только будущее
@@ -760,10 +749,7 @@ def main():
                         f"({event_time.strftime('%H:%M')})"
                     )
 
-                    token = prepared_token
-                    if token is None:
-                        print("⚠️ Token не был подготовлен заранее. Получаем сейчас.")
-                        token = get_tuya_token()
+                    token = get_socket_monitor_token()
 
                     start_azan_async(
                         token,
@@ -772,8 +758,7 @@ def main():
                     )
                     handled_prayers.add(prayer_key)
 
-                    prepared_token = None
-                    prepared_prayer_key = None
+
 
                 elif difference > 120:
                     handled_prayers.add(prayer_key)
