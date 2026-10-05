@@ -30,7 +30,7 @@ SOCKET_SWITCH_CODE = "switch_1"
 # Проверяем локальное время каждые 5 секунд.
 # Это НЕ запрос к Tuya.
 CHECK_INTERVAL_SECONDS = 5
-SOCKET_STATUS_CHECK_SECONDS = 10
+SOCKET_STATUS_CHECK_SECONDS = 3600
 SOCKET_TOKEN_REFRESH_SECONDS = 3600
 
 # За сколько минут до азана заранее получаем Tuya token.
