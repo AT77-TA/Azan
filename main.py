@@ -662,7 +662,7 @@ def run_azan(token, prayer_name, prayer_time):
         current_state = get_socket_state(token)
         if not current_state:
             set_socket(token, True)
-        telegram_notify(f"🕌 {PRAYER_NAMES_RU.get(prayer_name, prayer_name)}\nАзан: {prayer_time} (+{START_DELAY_MINUTES} мин.)\nРозетка включена.\nАвтоматическое выключение через {AZAN_DURATION_MINUTES} минут.")
+        telegram_notify(f"🕌 {PRAYER_NAMES_RU.get(prayer_name, prayer_name)}\nАзан: {prayer_time} (+{START_DELAY_MINUTES} мин.)\nРозетка включена АВТОМАТИЧЕСКИ.\nАвтоматическое выключение через {AZAN_DURATION_MINUTES} минут.")
         time.sleep(AZAN_DURATION_MINUTES * 60)
         set_socket(token, False)
         telegram_notify(f"🔌 {PRAYER_NAMES_RU.get(prayer_name, prayer_name)}: розетка выключена.")
