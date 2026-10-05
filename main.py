@@ -25,6 +25,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SCHEDULE_FILE = "schedule.json"
+SOCKET_SWITCH_CODE = "switch_1"
 
 # Проверяем локальное время каждые 5 секунд.
 # Это НЕ запрос к Tuya.
@@ -325,9 +326,11 @@ def get_socket_state(token):
     )
 
     for item in data["result"]:
+        if item["code"] == SOCKET_SWITCH_CODE:
+            return bool(item["value"])
+
         if item["code"] in (
             "switch",
-            "switch_1",
             "switch_led",
         ):
             return bool(item["value"])
@@ -349,7 +352,7 @@ def set_socket(token, state):
         {
             "commands": [
                 {
-                    "code": "switch",
+                    "code": SOCKET_SWITCH_CODE,
                     "value": state,
                 }
             ]
