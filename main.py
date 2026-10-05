@@ -29,6 +29,8 @@ SCHEDULE_FILE = "schedule.json"
 # Проверяем локальное время каждые 5 секунд.
 # Это НЕ запрос к Tuya.
 CHECK_INTERVAL_SECONDS = 5
+SOCKET_STATUS_CHECK_SECONDS = 10
+SOCKET_TOKEN_REFRESH_SECONDS = 3600
 
 # За сколько минут до азана заранее получаем Tuya token.
 PREPARE_MINUTES = 5
@@ -54,6 +56,15 @@ last_telegram_check = None
 TELEGRAM_CHECK_INTERVAL_SECONDS = 3
 prepared_token = None
 prepared_prayer_key = None
+
+# Мониторинг состояния розетки
+last_socket_state = None
+last_socket_check = None
+socket_is_online = None
+socket_offline_notified = False
+socket_monitor_token = None
+socket_monitor_token_time = None
+
 PRAYER_NAMES_RU = {"Fajr":"Фаджр","Dhuhr":"Зухр","Asr":"Аср","Maghrib":"Магриб","Isha":"Иша"}
 
 
@@ -327,6 +338,8 @@ def get_socket_state(token):
 
 
 def set_socket(token, state):
+    global last_socket_state
+
     path = (
         f"/v1.0/devices/"
         f"{TUYA_DEVICE_ID}/commands"
@@ -350,6 +363,8 @@ def set_socket(token, state):
         path,
         body,
     )
+
+    last_socket_state = bool(state)
 
     print(
         f"🔌 Розетка: "
@@ -444,6 +459,21 @@ def get_telegram_updates():
         return []
 
 
+def get_today_events():
+    schedule = get_today_schedule()
+    events = {}
+
+    for prayer in PRAYERS:
+        prayer_time = schedule.get(prayer)
+        if not prayer_time:
+            continue
+
+        prayer_dt = get_prayer_datetime(prayer_time)
+        events[prayer] = prayer_dt + timedelta(minutes=START_DELAY_MINUTES)
+
+    return events
+
+
 def send_schedule_to_telegram():
     schedule = get_today_schedule()
     now = datetime.now(TIMEZONE)
@@ -458,9 +488,102 @@ def send_schedule_to_telegram():
     telegram_notify(message, show_keyboard=True)
 
 
+def get_socket_monitor_token():
+    global socket_monitor_token, socket_monitor_token_time
+
+    now = time.time()
+
+    if (
+        socket_monitor_token is not None
+        and socket_monitor_token_time is not None
+        and now - socket_monitor_token_time < SOCKET_TOKEN_REFRESH_SECONDS
+    ):
+        return socket_monitor_token
+
+    socket_monitor_token = get_tuya_token()
+    socket_monitor_token_time = now
+    return socket_monitor_token
+
+
 def get_manual_tuya_token():
-    global prepared_token
-    return prepared_token if prepared_token is not None else get_tuya_token()
+    return prepared_token if prepared_token is not None else get_socket_monitor_token()
+
+
+def check_socket_manual_changes():
+    global last_socket_state
+    global last_socket_check
+    global socket_is_online
+    global socket_offline_notified
+
+    now = datetime.now(TIMEZONE)
+
+    if last_socket_check is not None:
+        seconds_passed = (now - last_socket_check).total_seconds()
+        if seconds_passed < SOCKET_STATUS_CHECK_SECONDS:
+            return
+
+    last_socket_check = now
+
+    try:
+        current_state = get_socket_state(get_socket_monitor_token())
+
+        # Связь с розеткой восстановилась.
+        if socket_is_online is False:
+            telegram_notify(
+                "🟢 РОЗЕТКА ONLINE\n\n"
+                "🕌 Шенджийская мечеть\n"
+                "🔌 Связь восстановлена"
+            )
+
+        socket_is_online = True
+        socket_offline_notified = False
+
+        # Первый опрос после запуска — только запоминаем состояние.
+        if last_socket_state is None:
+            last_socket_state = current_state
+            print(
+                "🔍 Начальное состояние розетки: "
+                + ("ВКЛ" if current_state else "ВЫКЛ")
+            )
+            return
+
+        # Состояние не изменилось.
+        if current_state == last_socket_state:
+            return
+
+        old_state = last_socket_state
+        last_socket_state = current_state
+
+        print(
+            f"🔄 Изменение состояния розетки: "
+            f"{old_state} → {current_state}"
+        )
+
+        # Внешнее изменение: Smart Life / Tuya / физическая кнопка.
+        if current_state:
+            telegram_notify(
+                "👤 РУЧНОЕ УПРАВЛЕНИЕ\n\n"
+                "🟢 Розетка включена\n"
+                f"🕐 {now.strftime('%H:%M:%S')}"
+            )
+        else:
+            telegram_notify(
+                "👤 РУЧНОЕ УПРАВЛЕНИЕ\n\n"
+                "🔴 Розетка выключена\n"
+                f"🕐 {now.strftime('%H:%M:%S')}"
+            )
+
+    except Exception as error:
+        socket_is_online = False
+        print(f"❌ Розетка недоступна: {error}")
+
+        if not socket_offline_notified:
+            telegram_notify(
+                "⚠️ РОЗЕТКА OFFLINE\n\n"
+                "🕌 Шенджийская мечеть\n\n"
+                "Не удаётся получить состояние устройства."
+            )
+            socket_offline_notified = True
 
 
 def send_system_status():
@@ -555,51 +678,117 @@ def start_azan_async(token, prayer_name, prayer_time):
 
 def main():
     global prepared_token, prepared_prayer_key
+
     check_environment()
     setup_telegram_commands()
+
     print("🚀 Azan Bot запущен")
     print("🌍 Часовой пояс: Europe/Moscow")
     print(f"⏱ Проверка времени: {CHECK_INTERVAL_SECONDS} сек.")
     print(f"🔑 Подготовка Tuya: за {PREPARE_MINUTES} мин.")
+    print(f"🔌 Мониторинг розетки: каждые {SOCKET_STATUS_CHECK_SECONDS} сек.")
+
     handled_prayers = set()
-    telegram_notify("🟢 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n🤖 Система автоматического азана запущена\n📡 Telegram управление активно\n⚙️ Режим: 24/7\n\n👇 Используйте кнопки управления", show_keyboard=True)
+    handled_date = None
+
+    telegram_notify(
+        "🟢 ШЕНДЖИЙСКАЯ МЕЧЕТЬ\n\n"
+        "🤖 Система автоматического азана запущена\n"
+        "🔌 Мониторинг розетки активен\n"
+        "📡 Telegram управление активно\n"
+        "⚙️ Режим: 24/7\n\n"
+        "👇 Используйте кнопки управления",
+        show_keyboard=True,
+    )
+
     try:
         send_schedule_to_telegram()
     except Exception as error:
         print(f"⚠️ Не удалось отправить расписание при запуске: {error}")
+
     while True:
         try:
             process_telegram_commands()
+            check_socket_manual_changes()
+
             now = datetime.now(TIMEZONE)
+
+            # Новый календарный день: начинаем отсчёт событий заново.
+            if handled_date != now.date():
+                handled_prayers.clear()
+                handled_date = now.date()
+
+            # Следующий будущий азан используется только для подготовки Tuya.
             next_prayer = get_next_prayer()
-            if next_prayer is None:
-                if now.hour == 0 and now.minute == 0:
-                    handled_prayers.clear()
-                time.sleep(CHECK_INTERVAL_SECONDS)
-                continue
-            start_dt, prayer_name, prayer_time = next_prayer
-            prayer_key = (now.date().isoformat(), prayer_name)
-            minutes_until = (start_dt - now).total_seconds() / 60
-            if prepared_prayer_key != prayer_key and 0 < minutes_until <= PREPARE_MINUTES:
-                print(f"🔑 До {prayer_name} осталось {minutes_until:.1f} мин. — готовим Tuya")
-                prepared_token = get_tuya_token()
-                prepared_prayer_key = prayer_key
-            if now >= start_dt and prayer_key not in handled_prayers:
-                token = prepared_token
-                if token is None:
-                    print("⚠️ Token не был подготовлен заранее. Получаем сейчас.")
-                    token = get_tuya_token()
-                start_azan_async(token, prayer_name, prayer_time)
-                handled_prayers.add(prayer_key)
-                prepared_token = None
-                prepared_prayer_key = None
+
+            if next_prayer is not None:
+                start_dt, prayer_name, prayer_time = next_prayer
+                prayer_key = (now.date().isoformat(), prayer_name)
+                minutes_until = (start_dt - now).total_seconds() / 60
+
+                if (
+                    prepared_prayer_key != prayer_key
+                    and 0 < minutes_until <= PREPARE_MINUTES
+                ):
+                    print(
+                        f"🔑 До {prayer_name} осталось "
+                        f"{minutes_until:.1f} мин. — готовим Tuya"
+                    )
+                    prepared_token = get_tuya_token()
+                    prepared_prayer_key = prayer_key
+                    print(f"✅ Tuya подготовлена для {prayer_name}")
+
+            # Отдельно ищем уже наступившие события.
+            # Это важно: get_next_prayer() показывает только будущее
+            # и после 15:24 сам Аср из него исчезает.
+            events = get_today_events()
+
+            for prayer_name, event_time in events.items():
+                prayer_key = (now.date().isoformat(), prayer_name)
+
+                if prayer_key in handled_prayers:
+                    continue
+
+                difference = (now - event_time).total_seconds()
+
+                if 0 <= difference <= 120:
+                    print(
+                        f"🕌 Время азана: {prayer_name} "
+                        f"({event_time.strftime('%H:%M')})"
+                    )
+
+                    token = prepared_token
+                    if token is None:
+                        print("⚠️ Token не был подготовлен заранее. Получаем сейчас.")
+                        token = get_tuya_token()
+
+                    start_azan_async(
+                        token,
+                        prayer_name,
+                        get_today_schedule().get(prayer_name),
+                    )
+                    handled_prayers.add(prayer_key)
+
+                    prepared_token = None
+                    prepared_prayer_key = None
+
+                elif difference > 120:
+                    handled_prayers.add(prayer_key)
+                    print(
+                        f"⏭️ {prayer_name} уже прошёл более чем на 2 минуты — пропускаем"
+                    )
+
             time.sleep(CHECK_INTERVAL_SECONDS)
+
         except KeyboardInterrupt:
             print("🛑 Сервер остановлен вручную")
             break
+
         except Exception as error:
             print(f"❌ Ошибка основного цикла: {error}")
-            telegram_notify(f"❌ Azan Bot\nОшибка основного цикла:\n{error}")
+            telegram_notify(
+                f"❌ Azan Bot\nОшибка основного цикла:\n{error}"
+            )
             time.sleep(30)
 
 
