@@ -1,3 +1,15 @@
+"""
+Azan Bot — версия с подробными комментариями для обучения.
+
+Основная схема:
+- schedule.json содержит время молитв на даты.
+- главный цикл проверяет Telegram и локальное время каждые 5 секунд.
+- состояние розетки проверяется раз в час вне азана и каждые 10 секунд во время азана.
+- уведомления об изменении состояния отправляются только во время азана.
+- автоматический азан выполняется в отдельном потоке: включение, ожидание, выключение.
+- секреты берутся из переменных окружения и не должны публиковаться.
+"""
+
 import os
 import json
 import time
@@ -27,19 +39,26 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SCHEDULE_FILE = "schedule.json"
 SOCKET_SWITCH_CODE = "switch_1"
 
-# Проверяем локальное время каждые 5 секунд.
-# Это НЕ запрос к Tuya.
+# Главный цикл просыпается каждые 5 секунд, чтобы вовремя заметить наступление азана.
+# ВАЖНО: это только проверка локального времени, не запрос к Tuya.
 CHECK_INTERVAL_SECONDS = 5
+
+# Вне азана состояние розетки запрашивается не чаще раза в час (3600 секунд).
+# Во время окна азана этот интервал временно заменяется на 10 секунд.
 SOCKET_STATUS_CHECK_SECONDS = 3600
+
+# Сколько секунд используем сохранённый токен, прежде чем запросить новый.
+# При ошибке Tuya 1010 токен обновляется сразу и исходный запрос повторяется один раз.
 SOCKET_TOKEN_REFRESH_SECONDS = 3600
 
-# За сколько минут до азана заранее получаем Tuya token.
+# За сколько минут до азана заранее получаем токен Tuya.
 PREPARE_MINUTES = 5
 
-# Через сколько минут после включения выключаем розетку.
+# Сколько минут держим розетку включённой для азана.
 AZAN_DURATION_MINUTES = 6
 
-# +2 минуты к времени из расписания.
+# Сколько минут прибавляем к времени из schedule.json.
+# Пример: в JSON указано 15:22, при значении 2 запуск будет в 15:24.
 START_DELAY_MINUTES = 2
 
 # Названия молитв, которые используем.
@@ -65,6 +84,8 @@ socket_is_online = None
 socket_offline_notified = False
 socket_monitor_token = None
 socket_monitor_token_time = None
+# До этого времени включён частый мониторинг во время азана.
+azan_monitor_until = 0
 
 PRAYER_NAMES_RU = {"Fajr":"Фаджр","Dhuhr":"Зухр","Asr":"Аср","Maghrib":"Магриб","Isha":"Иша"}
 
@@ -98,6 +119,7 @@ def check_environment():
 # =========================
 
 def load_schedule():
+    """Открывает schedule.json и преобразует JSON-текст в объект Python."""
     if not os.path.exists(SCHEDULE_FILE):
         raise FileNotFoundError(
             f"Файл {SCHEDULE_FILE} не найден"
@@ -110,6 +132,7 @@ def load_schedule():
 
 
 def get_today_schedule():
+    """Возвращает расписание только для сегодняшней даты."""
     data = load_schedule()
 
     today = datetime.now(TIMEZONE).date()
@@ -139,6 +162,7 @@ def get_today_schedule():
 # =========================
 
 def get_prayer_datetime(prayer_time):
+    """Преобразует строку времени вроде 15:22 в дату/время на сегодня."""
     now = datetime.now(TIMEZONE)
 
     hour, minute = map(int, prayer_time.split(":"))
@@ -152,6 +176,7 @@ def get_prayer_datetime(prayer_time):
 
 
 def get_next_prayer():
+    """Ищет ближайший будущий азан с учётом задержки запуска."""
     schedule = get_today_schedule()
 
     now = datetime.now(TIMEZONE)
@@ -248,27 +273,17 @@ def get_tuya_token():
     return token
 
 
-def tuya_request(token, method, path, body=""):
+def tuya_request(token, method, path, body="", retry_invalid_token=True):
+    """
+    Отправляет запрос в Tuya.
+    Если Tuya вернула 1010 (token invalid), один раз получает новый токен
+    и повторяет исходный запрос.
+    """
     timestamp = str(int(time.time() * 1000))
 
-    body_hash = hashlib.sha256(
-        body.encode()
-    ).hexdigest()
-
-    string_to_sign = (
-        method
-        + "\n"
-        + body_hash
-        + "\n\n"
-        + path
-    )
-
-    sign_message = (
-        TUYA_ACCESS_ID
-        + token
-        + timestamp
-        + string_to_sign
-    )
+    body_hash = hashlib.sha256(body.encode()).hexdigest()
+    string_to_sign = method + "\\n" + body_hash + "\\n\\n" + path
+    sign_message = TUYA_ACCESS_ID + token + timestamp + string_to_sign
 
     sign = hmac.new(
         TUYA_ACCESS_SECRET.encode(),
@@ -288,32 +303,42 @@ def tuya_request(token, method, path, body=""):
     url = TUYA_BASE_URL + path
 
     if method == "GET":
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=15,
-        )
+        response = requests.get(url, headers=headers, timeout=15)
     else:
         response = requests.post(
-            url,
-            headers=headers,
-            data=body,
-            timeout=15,
+            url, headers=headers, data=body, timeout=15
         )
 
     response.raise_for_status()
-
     data = response.json()
 
     if not data.get("success"):
-        raise RuntimeError(
-            f"Tuya API error: {data}"
-        )
+        # Код 1010 означает, что токен недействителен.
+        if (
+            retry_invalid_token
+            and str(data.get("code")) == "1010"
+        ):
+            global socket_monitor_token, socket_monitor_token_time
+            global prepared_token
+
+            print("⚠️ Tuya token недействителен. Обновляем и повторяем запрос один раз.")
+            fresh_token = get_tuya_token()
+            socket_monitor_token = fresh_token
+            socket_monitor_token_time = time.time()
+            prepared_token = fresh_token
+
+            return tuya_request(
+                fresh_token, method, path, body,
+                retry_invalid_token=False,
+            )
+
+        raise RuntimeError(f"Tuya API error: {data}")
 
     return data
 
 
 def get_socket_state(token):
+    """Запрашивает состояние розетки: True — включена, False — выключена."""
     path = (
         f"/v1.0/devices/"
         f"{TUYA_DEVICE_ID}/status"
@@ -341,6 +366,7 @@ def get_socket_state(token):
 
 
 def set_socket(token, state):
+    """Отправляет Tuya команду включить/выключить розетку."""
     global last_socket_state
 
     path = (
@@ -492,6 +518,7 @@ def send_schedule_to_telegram():
 
 
 def get_socket_monitor_token():
+    """Возвращает токен из кэша или запрашивает новый, если срок кэша истёк."""
     global socket_monitor_token, socket_monitor_token_time
 
     now = time.time()
@@ -513,24 +540,37 @@ def get_manual_tuya_token():
 
 
 def check_socket_manual_changes():
-    global last_socket_state
-    global last_socket_check
-    global socket_is_online
-    global socket_offline_notified
+    """    Проверяет состояние розетки с разной частотой:
+    - вне азана: раз в час, только для контроля доступности и запоминания состояния;
+    - во время азана: каждые 10 секунд, с уведомлениями об изменениях состояния.
 
+    Вне азана ручные включения/выключения не отправляются в Telegram.
+    Ошибки OFFLINE/восстановление ONLINE сообщаются один раз на смену состояния связи.
+    """
+    global last_socket_state, last_socket_check
+    global socket_is_online, socket_offline_notified
+
+    # Получаем текущее локальное время для отметок и выбора интервала.
     now = datetime.now(TIMEZONE)
+    # azan_monitor_until хранит timestamp, до которого действует частый мониторинг.
+    monitoring_during_azan = time.time() < azan_monitor_until
+    # Выбираем интервал: 10 секунд во время азана, 3600 секунд в остальное время.
+    interval = 10 if monitoring_during_azan else SOCKET_STATUS_CHECK_SECONDS
 
+    # Если предыдущая проверка была недавно, ничего не запрашиваем у Tuya.
     if last_socket_check is not None:
         seconds_passed = (now - last_socket_check).total_seconds()
-        if seconds_passed < SOCKET_STATUS_CHECK_SECONDS:
+        if seconds_passed < interval:
             return
 
+    # Запоминаем время попытки, чтобы даже при ошибке не повторять запрос сразу.
     last_socket_check = now
 
     try:
+        # Получаем токен из кэша и запрашиваем фактическое состояние розетки.
         current_state = get_socket_state(get_socket_monitor_token())
 
-        # Связь с розеткой восстановилась.
+        # Если предыдущая проверка показала Offline, сообщаем о восстановлении.
         if socket_is_online is False:
             telegram_notify(
                 "🟢 РОЗЕТКА ONLINE\n\n"
@@ -538,48 +578,50 @@ def check_socket_manual_changes():
                 "🔌 Связь восстановлена"
             )
 
+        # С этого момента считаем устройство доступным.
         socket_is_online = True
         socket_offline_notified = False
 
-        # Первый опрос после запуска — только запоминаем состояние.
+        # При самом первом опросе ещё нет предыдущего состояния для сравнения.
         if last_socket_state is None:
             last_socket_state = current_state
-            print(
-                "🔍 Начальное состояние розетки: "
-                + ("ВКЛ" if current_state else "ВЫКЛ")
-            )
+            print("🔍 Начальное состояние розетки: " + ("ВКЛ" if current_state else "ВЫКЛ"))
             return
 
-        # Состояние не изменилось.
+        # Если состояние осталось прежним, уведомлять не о чем.
         if current_state == last_socket_state:
             return
 
+        # Сохраняем новое состояние; это предотвращает повтор уведомления на следующем опросе.
         old_state = last_socket_state
         last_socket_state = current_state
+        print(f"🔄 Изменение состояния розетки: {old_state} → {current_state}")
 
-        print(
-            f"🔄 Изменение состояния розетки: "
-            f"{old_state} → {current_state}"
-        )
+        # Вне азана состояние только запоминается: сообщения о ручном управлении не нужны.
+        if not monitoring_during_azan:
+            print("ℹ️ Состояние изменилось вне азана; уведомление не отправляем.")
+            return
 
-        # Внешнее изменение: Smart Life / Tuya / физическая кнопка.
+        # Во время азана сообщаем об изменении, которое не было отражено собственной командой.
         if current_state:
             telegram_notify(
-                "👤 РУЧНОЕ УПРАВЛЕНИЕ\n\n"
+                "👤 ИЗМЕНЕНИЕ СОСТОЯНИЯ ВО ВРЕМЯ АЗАНА\n\n"
                 "🟢 Розетка включена\n"
                 f"🕐 {now.strftime('%H:%M:%S')}"
             )
         else:
             telegram_notify(
-                "👤 РУЧНОЕ УПРАВЛЕНИЕ\n\n"
+                "👤 ИЗМЕНЕНИЕ СОСТОЯНИЯ ВО ВРЕМЯ АЗАНА\n\n"
                 "🔴 Розетка выключена\n"
                 f"🕐 {now.strftime('%H:%M:%S')}"
             )
 
     except Exception as error:
+        # Ошибка запроса может означать потерю связи или проблему авторизации Tuya.
         socket_is_online = False
         print(f"❌ Розетка недоступна: {error}")
 
+        # Отправляем OFFLINE только один раз, чтобы не засорять Telegram повторениями.
         if not socket_offline_notified:
             telegram_notify(
                 "⚠️ РОЗЕТКА OFFLINE\n\n"
@@ -590,6 +632,7 @@ def check_socket_manual_changes():
 
 
 def send_system_status():
+    """Формирует ответ на кнопку/команду Статус в Telegram."""
     now = datetime.now(TIMEZONE)
     socket_status, socket_power = "🔴 OFFLINE", "⚠️ НЕДОСТУПНО"
     try:
@@ -617,6 +660,7 @@ def send_help():
 
 
 def process_telegram_commands():
+    """Получает новые сообщения Telegram и запускает соответствующие действия."""
     global telegram_update_offset, last_telegram_check, prepared_token
     now = datetime.now(TIMEZONE)
     if last_telegram_check is not None and (now - last_telegram_check).total_seconds() < TELEGRAM_CHECK_INTERVAL_SECONDS:
@@ -658,6 +702,7 @@ def process_telegram_commands():
 # =========================
 
 def run_azan(token, prayer_name, prayer_time):
+    """Выполняет азан: проверяет состояние, при необходимости включает, ждёт 6 минут и выключает."""
     try:
         current_state = get_socket_state(token)
         if not current_state:
@@ -672,7 +717,18 @@ def run_azan(token, prayer_name, prayer_time):
 
 
 def start_azan_async(token, prayer_name, prayer_time):
-    threading.Thread(target=run_azan, args=(token, prayer_name, prayer_time), daemon=True).start()
+    """Запускает азан в отдельном потоке, не останавливая основной цикл."""
+    global azan_monitor_until
+    # Включаем частый опрос на длительность азана + небольшой запас.
+    azan_monitor_until = max(
+        azan_monitor_until,
+        time.time() + AZAN_DURATION_MINUTES * 60 + 20,
+    )
+    threading.Thread(
+        target=run_azan,
+        args=(token, prayer_name, prayer_time),
+        daemon=True,
+    ).start()
 
 
 # =========================
@@ -680,6 +736,7 @@ def start_azan_async(token, prayer_name, prayer_time):
 # =========================
 
 def main():
+    """Точка входа: проверка настроек, запуск Telegram и главный бесконечный цикл."""
     global prepared_token, prepared_prayer_key
 
     check_environment()
@@ -689,7 +746,7 @@ def main():
     print("🌍 Часовой пояс: Europe/Moscow")
     print(f"⏱ Проверка времени: {CHECK_INTERVAL_SECONDS} сек.")
     print(f"🔑 Подготовка Tuya: за {PREPARE_MINUTES} мин.")
-    print(f"🔌 Мониторинг розетки: каждые {SOCKET_STATUS_CHECK_SECONDS} сек.")
+    print("🔌 Мониторинг розетки: раз в час обычно, каждые 10 секунд во время азана.")
 
     handled_prayers = set()
     handled_date = None
@@ -711,9 +768,14 @@ def main():
 
     while True:
         try:
+            # Получаем и обрабатываем новые команды пользователя в Telegram.
             process_telegram_commands()
+
+            # Проверяем розетку по режиму: раз в час вне азана, каждые 10 секунд во время азана.
+            # Вне азана смена состояния запоминается без сообщения о ручном вмешательстве.
             check_socket_manual_changes()
 
+            # Берём текущее время в часовом поясе Москвы для проверки расписания.
             now = datetime.now(TIMEZONE)
 
             # Новый календарный день: начинаем отсчёт событий заново.
